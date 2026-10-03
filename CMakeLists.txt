@@ -18,9 +18,18 @@ target_compile_definitions(cassandra_function_tests PRIVATE
   CASS_DRIVER_VERSION="${CASSANDRA_VERSION}")
 target_compile_options(cassandra_function_tests PRIVATE -Wall -Wextra)
 
+# build tree: link against the driver install prefix
+# install tree: resolve libcassandra.so next to the binary ($ORIGIN/lib)
 set_target_properties(cassandra_function_tests PROPERTIES
   BUILD_RPATH "${CASSANDRA_LIBDIR}"
-  INSTALL_RPATH "${CASSANDRA_LIBDIR}")
+  INSTALL_RPATH "\$ORIGIN/lib"
+  INSTALL_RPATH_USE_LINK_PATH FALSE)
+
+install(TARGETS cassandra_function_tests RUNTIME DESTINATION .)
+install(FILES cassandra.conf DESTINATION .)
+
+file(GLOB CASSANDRA_BUNDLED_LIBS "${CASSANDRA_LIBDIR}/libcassandra.so*")
+install(FILES ${CASSANDRA_BUNDLED_LIBS} DESTINATION lib)
 
 enable_testing()
 add_test(NAME function_tests COMMAND cassandra_function_tests)

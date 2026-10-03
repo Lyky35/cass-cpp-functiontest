@@ -2,12 +2,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -17,16 +20,149 @@
 
 namespace {
 
-const char* env(const char* key, const char* fallback) {
-  const char* value = std::getenv(key);
-  return value ? value : fallback;
+// ---------------------------------------------------------------------------
+// connection config: built-in defaults < config file < environment variables
+// ---------------------------------------------------------------------------
+struct ConnectionConfig {
+  std::string host = "127.0.0.1";
+  int port = 9042;
+  int protocol = 4;
+  std::string user = "appuser";
+  std::string password = "appuser123";
+  std::string keyspace = "demo";
+  std::string source = "built-in defaults";
+};
+
+ConnectionConfig g_config;
+
+// diagnostics of the test that is currently running
+std::ostringstream g_diag;
+
+bool g_color = false;
+
+std::string trim(const std::string& text) {
+  size_t begin = text.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) return std::string();
+  size_t end = text.find_last_not_of(" \t\r\n");
+  return text.substr(begin, end - begin + 1);
 }
 
-const char* HOST = env("CASSANDRA_HOST", "127.0.0.1");
-int PORT = std::atoi(env("CASSANDRA_PORT", "9042"));
-const char* USER = env("CASSANDRA_USER", "appuser");
-const char* PASS = env("CASSANDRA_PASSWORD", "appuser123");
-const char* KEYSPACE = env("CASSANDRA_KEYSPACE", "demo");
+std::string lower(std::string text) {
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] >= 'A' && text[i] <= 'Z') text[i] = static_cast<char>(text[i] - 'A' + 'a');
+  }
+  return text;
+}
+
+void apply_connection_string(ConnectionConfig* config, const std::string& value);
+
+void apply_setting(ConnectionConfig* config, const std::string& raw_key,
+                   const std::string& raw_value) {
+  std::string key = lower(trim(raw_key));
+  std::string value = trim(raw_value);
+  if (key.empty()) return;
+  if (key == "connection") {
+    apply_connection_string(config, value);
+  } else if (key == "host" || key == "contact points" || key == "contact_points") {
+    config->host = value;
+  } else if (key == "port") {
+    int port = std::atoi(value.c_str());
+    if (port > 0) config->port = port;
+  } else if (key == "protocol") {
+    std::string version = value;
+    if (!version.empty() && (version[0] == 'v' || version[0] == 'V')) {
+      version = version.substr(1);
+    }
+    int protocol = std::atoi(version.c_str());
+    if (protocol >= 3 && protocol <= 5) config->protocol = protocol;
+  } else if (key == "user" || key == "username") {
+    config->user = value;
+  } else if (key == "password") {
+    config->password = value;
+  } else if (key == "keyspace") {
+    config->keyspace = value;
+  }
+}
+
+// contact points=127.0.0.1; port=9042; username=appuser; password=secret; keyspace=demo
+void apply_connection_string(ConnectionConfig* config, const std::string& value) {
+  std::istringstream parts(value);
+  std::string part;
+  while (std::getline(parts, part, ';')) {
+    size_t separator = part.find('=');
+    if (separator == std::string::npos) continue;
+    apply_setting(config, part.substr(0, separator), part.substr(separator + 1));
+  }
+}
+
+bool load_config_file(const std::string& path, ConnectionConfig* config, std::string* error) {
+  std::ifstream input(path.c_str());
+  if (!input) {
+    *error = "cannot open config file: " + path;
+    return false;
+  }
+  std::string line;
+  int line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    std::string text = trim(line);
+    if (text.empty() || text[0] == '#' || text.rfind("//", 0) == 0) continue;
+    size_t separator = text.find('=');
+    if (separator == std::string::npos) {
+      *error = path + ":" + std::to_string(line_number) + ": expected 'key = value'";
+      return false;
+    }
+    apply_setting(config, text.substr(0, separator), text.substr(separator + 1));
+  }
+  config->source = path;
+  return true;
+}
+
+void apply_environment(ConnectionConfig* config) {
+  bool used = false;
+  if (const char* value = std::getenv("CASSANDRA_HOST")) {
+    config->host = value;
+    used = true;
+  }
+  if (const char* value = std::getenv("CASSANDRA_PORT")) {
+    int port = std::atoi(value);
+    if (port > 0) config->port = port;
+    used = true;
+  }
+  if (const char* value = std::getenv("CASSANDRA_PROTOCOL")) {
+    int protocol = std::atoi(value);
+    if (protocol >= 3 && protocol <= 5) config->protocol = protocol;
+    used = true;
+  }
+  if (const char* value = std::getenv("CASSANDRA_USER")) {
+    config->user = value;
+    used = true;
+  }
+  if (const char* value = std::getenv("CASSANDRA_PASSWORD")) {
+    config->password = value;
+    used = true;
+  }
+  if (const char* value = std::getenv("CASSANDRA_KEYSPACE")) {
+    config->keyspace = value;
+    used = true;
+  }
+  if (used) config->source += " + environment";
+}
+
+std::string executable_dir() {
+  char buffer[4096];
+  ssize_t length = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+  if (length <= 0) return std::string();
+  buffer[length] = '\0';
+  std::string path(buffer);
+  size_t slash = path.find_last_of('/');
+  return slash == std::string::npos ? std::string() : path.substr(0, slash);
+}
+
+std::string paint(const char* code, const char* text) {
+  if (!g_color) return text;
+  return std::string("\033[") + code + "m" + text + "\033[0m";
+}
 
 // ---------------------------------------------------------------------------
 // tiny test harness
@@ -53,8 +189,8 @@ struct AutoRegister {
 #define EXPECT_TRUE(cond)                                                       \
   do {                                                                          \
     if (!(cond)) {                                                              \
-      std::cerr << "      FAILED: " #cond << " (" << __FILE__ << ":" << __LINE__ \
-                << ")" << std::endl;                                            \
+      g_diag << "      FAILED: " #cond << " (" << __FILE__ << ":" << __LINE__   \
+             << ")" << std::endl;                                               \
       return false;                                                             \
     }                                                                           \
   } while (0)
@@ -62,8 +198,8 @@ struct AutoRegister {
 template <typename A, typename B>
 bool expect_eq(const A& actual, const B& expected, const char* expr, const char* file, int line) {
   if (actual == expected) return true;
-  std::cerr << "      FAILED: " << expr << " -> got [" << actual << "] expected [" << expected
-            << "] (" << file << ":" << line << ")" << std::endl;
+  g_diag << "      FAILED: " << expr << " -> got [" << actual << "] expected [" << expected
+         << "] (" << file << ":" << line << ")" << std::endl;
   return false;
 }
 
@@ -81,9 +217,9 @@ void print_future_error(const std::string& context, CassFuture* future) {
   const char* message = NULL;
   size_t length = 0;
   cass_future_error_message(future, &message, &length);
-  std::cerr << "      " << context << " -> " << cass_error_desc(code) << " (" << code << ")";
-  if (length > 0 && message) std::cerr << ": " << std::string(message, length);
-  std::cerr << std::endl;
+  g_diag << "      " << context << " -> " << cass_error_desc(code) << " (" << code << ")";
+  if (length > 0 && message) g_diag << ": " << std::string(message, length);
+  g_diag << std::endl;
 }
 
 const CassResult* run(CassSession* session, const std::string& cql) {
@@ -176,9 +312,11 @@ std::string uuid_str(const CassUuid& uuid) {
 // ---------------------------------------------------------------------------
 CassCluster* make_cluster() {
   CassCluster* cluster = cass_cluster_new();
-  cass_cluster_set_contact_points(cluster, HOST);
-  cass_cluster_set_port(cluster, PORT);
-  cass_cluster_set_credentials(cluster, USER, PASS);
+  cass_cluster_set_contact_points(cluster, g_config.host.c_str());
+  cass_cluster_set_port(cluster, g_config.port);
+  cass_cluster_set_credentials(cluster, g_config.user.c_str(), g_config.password.c_str());
+  cass_cluster_set_protocol_version(cluster, g_config.protocol);
+  if (g_config.protocol >= 5) cass_cluster_set_use_beta_protocol_version(cluster, cass_true);
   cass_cluster_set_connect_timeout(cluster, 10000);
   cass_cluster_set_request_timeout(cluster, 15000);
   cass_cluster_set_token_aware_routing(cluster, cass_true);
@@ -207,9 +345,9 @@ TEST(t01_connect_with_auth) {
 
   // wrong credentials must be rejected by PasswordAuthenticator
   CassCluster* bad_cluster = cass_cluster_new();
-  cass_cluster_set_contact_points(bad_cluster, HOST);
-  cass_cluster_set_port(bad_cluster, PORT);
-  cass_cluster_set_credentials(bad_cluster, USER, "definitely-not-the-password");
+  cass_cluster_set_contact_points(bad_cluster, g_config.host.c_str());
+  cass_cluster_set_port(bad_cluster, g_config.port);
+  cass_cluster_set_credentials(bad_cluster, g_config.user.c_str(), "definitely-not-the-password");
   CassSession* bad_session = cass_session_new();
   CassFuture* bad_future = cass_session_connect(bad_session, bad_cluster);
   cass_future_wait_timed(bad_future, 30 * 1000 * 1000ULL);
@@ -1073,13 +1211,13 @@ TEST(t19_row_iteration) {
 TEST(t20_schema_metadata) {
   const CassSchemaMeta* schema = cass_session_get_schema_meta(g_session);
   EXPECT_TRUE(schema != NULL);
-  const CassKeyspaceMeta* keyspace = cass_schema_meta_keyspace_by_name(schema, KEYSPACE);
+  const CassKeyspaceMeta* keyspace = cass_schema_meta_keyspace_by_name(schema, g_config.keyspace.c_str());
   EXPECT_TRUE(keyspace != NULL);
   const char* name = NULL;
   size_t name_length = 0;
   cass_keyspace_meta_name(keyspace, &name, &name_length);
   EXPECT_TRUE(name != NULL);
-  EXPECT_EQ(std::string(name, name_length), std::string(KEYSPACE));
+  EXPECT_EQ(std::string(name, name_length), g_config.keyspace);
 
   const CassTableMeta* table = cass_keyspace_meta_table_by_name(keyspace, "t_prep");
   EXPECT_TRUE(table != NULL);
@@ -1094,16 +1232,112 @@ TEST(t20_schema_metadata) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  const char* filter = argc > 1 ? argv[1] : NULL;
+namespace {
 
-  std::cout << "Cassandra C/C++ driver function tests\n"
-            << "  driver   : " << CASS_DRIVER_VERSION << "\n"
-            << "  cluster  : simple-cluster (single node, Cassandra 5.0.9)\n"
-            << "  endpoint : " << HOST << ":" << PORT << "\n"
-            << "  user     : " << USER << "\n"
-            << "  keyspace : " << KEYSPACE << "\n"
-            << std::endl;
+struct Options {
+  std::string config_path;
+  std::string filter;
+  bool verbose = false;
+  bool no_color = false;
+  bool help = false;
+};
+
+void print_usage(const char* program) {
+  std::cout << "usage: " << program << " [options] [test-name-filter]\n"
+            << "\n"
+            << "  --config <file>  connection config file (default: ./cassandra.conf,\n"
+            << "                   then <executable dir>/cassandra.conf)\n"
+            << "  --no-color       print PASSED/FAILED without colors\n"
+            << "  --verbose        show the driver's own log output\n"
+            << "  --help           show this help\n"
+            << "\n"
+            << "Connection settings come from the config file, overridable via\n"
+            << "CASSANDRA_HOST, CASSANDRA_PORT, CASSANDRA_PROTOCOL, CASSANDRA_USER,\n"
+            << "CASSANDRA_PASSWORD, CASSANDRA_KEYSPACE and CASSANDRA_CONFIG.\n";
+}
+
+bool parse_options(int argc, char** argv, Options* options) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--help" || arg == "-h") {
+      options->help = true;
+    } else if (arg == "--no-color") {
+      options->no_color = true;
+    } else if (arg == "--verbose") {
+      options->verbose = true;
+    } else if (arg == "--config") {
+      if (i + 1 >= argc) {
+        std::cerr << "error: --config requires a file path" << std::endl;
+        return false;
+      }
+      options->config_path = argv[++i];
+    } else if (!arg.empty() && arg[0] == '-') {
+      std::cerr << "error: unknown option: " << arg << std::endl;
+      return false;
+    } else if (options->filter.empty()) {
+      options->filter = arg;
+    }
+  }
+  return true;
+}
+
+// returns false when an explicitly requested config file cannot be loaded
+bool resolve_config(const Options& options, ConnectionConfig* config) {
+  std::string error;
+
+  if (!options.config_path.empty()) {
+    if (!load_config_file(options.config_path, config, &error)) {
+      std::cerr << error << std::endl;
+      return false;
+    }
+    return true;
+  }
+
+  const char* env_path = std::getenv("CASSANDRA_CONFIG");
+  if (env_path && *env_path) {
+    if (!load_config_file(env_path, config, &error)) {
+      std::cerr << error << std::endl;
+      return false;
+    }
+    return true;
+  }
+
+  std::vector<std::string> candidates;
+  candidates.push_back("cassandra.conf");
+  std::string dir = executable_dir();
+  if (!dir.empty()) candidates.push_back(dir + "/cassandra.conf");
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    std::ifstream probe(candidates[i].c_str());
+    if (!probe) continue;
+    probe.close();
+    if (!load_config_file(candidates[i], config, &error)) {
+      std::cerr << error << std::endl;
+      return false;
+    }
+    return true;
+  }
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  Options options;
+  if (!parse_options(argc, argv, &options)) {
+    print_usage(argv[0]);
+    return 2;
+  }
+  if (options.help) {
+    print_usage(argv[0]);
+    return 0;
+  }
+
+  if (!resolve_config(options, &g_config)) return 2;
+  apply_environment(&g_config);
+
+  g_color = !options.no_color && isatty(fileno(stdout)) && std::getenv("NO_COLOR") == NULL;
+  if (!options.verbose) cass_log_set_level(CASS_LOG_DISABLED);
 
   g_cluster = make_cluster();
   g_session = cass_session_new();
@@ -1112,12 +1346,41 @@ int main(int argc, char** argv) {
       cass_future_error_code(connect_future) != CASS_OK) {
     print_future_error("unable to connect", connect_future);
     cass_future_free(connect_future);
+    std::cerr << g_config.host << ":" << g_config.port << "\n" << g_diag.str();
     cass_session_free(g_session);
     cass_cluster_free(g_cluster);
     return 2;
   }
   cass_future_free(connect_future);
 
+  // server info for the banner
+  std::string cluster_version = "unknown";
+  std::string cluster_name = "unknown";
+  g_diag.str("");
+  g_diag.clear();
+  const CassResult* info = run(g_session, "SELECT release_version, cluster_name FROM system.local");
+  if (info) {
+    const CassRow* row = cass_result_first_row(info);
+    if (row) {
+      get_string(row, "release_version", &cluster_version);
+      get_string(row, "cluster_name", &cluster_name);
+    }
+    cass_result_free(info);
+  }
+  g_diag.str("");
+  g_diag.clear();
+
+  std::cout << "Cassandra C/C++ driver function tests\n"
+            << "  driver            : " << CASS_DRIVER_VERSION << "\n"
+            << "  protocol          : v" << g_config.protocol << "\n"
+            << "  cassandra cluster : " << cluster_version << " (\"" << cluster_name << "\")\n"
+            << "  endpoint          : " << g_config.host << ":" << g_config.port << "\n"
+            << "  user              : " << g_config.user << "\n"
+            << "  keyspace          : " << g_config.keyspace << "\n"
+            << "  config            : " << g_config.source << "\n"
+            << std::endl;
+
+  const std::string& filter = options.filter;
   int passed = 0;
   int failed = 0;
   int skipped = 0;
@@ -1125,24 +1388,35 @@ int main(int argc, char** argv) {
 
   for (size_t i = 0; i < all_tests().size(); ++i) {
     const TestCase& test = all_tests()[i];
-    if (filter && test.name.find(filter) == std::string::npos) {
+    if (!filter.empty() && test.name.find(filter) == std::string::npos) {
       ++skipped;
       continue;
     }
+    std::cout << "  " << test.name << " ... " << std::flush;
+    g_diag.str("");
+    g_diag.clear();
     bool ok = test.fn();
-    std::cout << (ok ? "  [PASS] " : "  [FAIL] ") << test.name << std::endl;
-    if (ok) {
-      ++passed;
-    } else {
-      ++failed;
+    std::cout << (ok ? paint("32", "PASSED") : paint("31", "FAILED")) << std::endl;
+    if (!ok) {
+      std::string diagnostics = g_diag.str();
+      if (!diagnostics.empty()) std::cout << diagnostics;
       failures.push_back(test.name);
+      ++failed;
+    } else {
+      ++passed;
     }
   }
 
-  std::cout << "\nSummary: " << passed << " passed, " << failed << " failed";
-  if (skipped > 0) std::cout << ", " << skipped << " skipped";
-  std::cout << " (of " << (passed + failed + skipped) << " total)" << std::endl;
-  for (size_t i = 0; i < failures.size(); ++i) std::cout << "  failed: " << failures[i] << "\n";
+  if (!failures.empty()) {
+    for (size_t i = 0; i < failures.size(); ++i) {
+      std::cout << "  " << paint("31", "failed") << ": " << failures[i] << "\n";
+    }
+  }
+
+  std::cout << "Summary: " << passed << " passed, " << failed << " failed out of "
+            << (passed + failed + skipped) << " total";
+  if (skipped > 0) std::cout << " (" << skipped << " skipped)";
+  std::cout << std::endl;
 
   CassFuture* close_future = cass_session_close(g_session);
   cass_future_wait(close_future);
