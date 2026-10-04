@@ -9,8 +9,24 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Where the cpp-driver is installed. Default: whatever pkg-config sees.
+# Point it at the Lyky35 proto-v5 fork install:
+#   cmake -S . -B build -DCASSANDRA_DRIVER_ROOT=/path/to/cassandra-cpp-driver/_install
+set(CASSANDRA_DRIVER_ROOT "" CACHE PATH
+    "cpp-driver install prefix (e.g. Lyky35/cassandra-cpp-driver branch proto-v5)")
+
+if(CASSANDRA_DRIVER_ROOT)
+  foreach(_pcdir lib/pkgconfig lib64/pkgconfig lib/x86_64-linux-gnu/pkgconfig)
+    if(EXISTS "${CASSANDRA_DRIVER_ROOT}/${_pcdir}/cassandra.pc")
+      set(ENV{PKG_CONFIG_PATH}
+          "${CASSANDRA_DRIVER_ROOT}/${_pcdir}:$ENV{PKG_CONFIG_PATH}")
+    endif()
+  endforeach()
+endif()
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(CASSANDRA REQUIRED IMPORTED_TARGET cassandra)
+message(STATUS "cpp-driver: ${CASSANDRA_VERSION} (${CASSANDRA_LIBDIR})")
 
 add_executable(cassandra_function_tests main.cpp)
 target_link_libraries(cassandra_function_tests PRIVATE PkgConfig::CASSANDRA)
