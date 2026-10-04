@@ -26,7 +26,7 @@ namespace {
 struct ConnectionConfig {
   std::string host = "127.0.0.1";
   int port = 9042;
-  int protocol = 4;
+  int protocol = 5;
   std::string user = "appuser";
   std::string password = "appuser123";
   std::string keyspace = "demo";
@@ -315,8 +315,18 @@ CassCluster* make_cluster() {
   cass_cluster_set_contact_points(cluster, g_config.host.c_str());
   cass_cluster_set_port(cluster, g_config.port);
   cass_cluster_set_credentials(cluster, g_config.user.c_str(), g_config.password.c_str());
-  cass_cluster_set_protocol_version(cluster, g_config.protocol);
-  if (g_config.protocol >= 5) cass_cluster_set_use_beta_protocol_version(cluster, cass_true);
+  CassError protocol_error = cass_cluster_set_protocol_version(cluster, g_config.protocol);
+  if (protocol_error != CASS_OK) {
+    // Drivers older than 2.18.0 gate v5 behind the beta protocol flag.
+    if (g_config.protocol >= 5 &&
+        cass_cluster_set_use_beta_protocol_version(cluster, cass_true) == CASS_OK) {
+      std::cerr << "note: protocol v" << g_config.protocol
+                << " is a beta version in this driver, enabling the beta protocol flag\n";
+    } else {
+      std::cerr << "warning: driver rejected protocol v" << g_config.protocol
+                << " (error " << protocol_error << "), using the driver default\n";
+    }
+  }
   cass_cluster_set_connect_timeout(cluster, 10000);
   cass_cluster_set_request_timeout(cluster, 15000);
   cass_cluster_set_token_aware_routing(cluster, cass_true);
@@ -1227,6 +1237,72 @@ TEST(t20_schema_metadata) {
   EXPECT_EQ(cass_data_type_type(udt), CASS_VALUE_TYPE_UDT);
   EXPECT_TRUE(cass_data_type_sub_type_count(udt) == 2);
   cass_schema_meta_free(schema);
+  return true;
+}
+
+// The duration data type (0x0015) exists only in native protocol v5, so this test
+// exercises the v5 wire format: zigzag vint encoding through bind and decode.
+TEST(t21_v5_duration_type) {
+  if (g_config.protocol < 5) {
+    g_diag << "      note: the duration type needs native protocol v5 (running v"
+           << g_config.protocol << ")\n";
+    EXPECT_TRUE(g_config.protocol >= 5);
+  }
+
+  EXPECT_TRUE(exec(g_session, "CREATE TABLE IF NOT EXISTS demo.t_duration "
+                              "(k text PRIMARY KEY, d duration)"));
+  EXPECT_TRUE(exec(g_session, "TRUNCATE demo.t_duration"));
+
+  const CassPrepared* insert =
+      prepare(g_session, "INSERT INTO demo.t_duration (k, d) VALUES (?, ?)");
+  EXPECT_TRUE(insert != NULL);
+
+  CassStatement* statement = cass_prepared_bind(insert);
+  EXPECT_EQ(cass_statement_bind_string(statement, 0, "duration-key"), CASS_OK);
+  EXPECT_EQ(cass_statement_bind_duration(statement, 1, 1, 2, 3600000000000LL), CASS_OK);
+  const CassResult* written = execute_statement(g_session, statement);
+  cass_statement_free(statement);
+  cass_prepared_free(insert);
+  EXPECT_TRUE(written != NULL);
+  cass_result_free(written);
+
+  const CassResult* rows =
+      run(g_session, "SELECT d FROM demo.t_duration WHERE k = 'duration-key'");
+  EXPECT_TRUE(rows != NULL);
+  const CassRow* row = cass_result_first_row(rows);
+  EXPECT_TRUE(row != NULL);
+  const CassValue* value = cass_row_get_column_by_name(row, "d");
+  EXPECT_TRUE(value != NULL);
+  EXPECT_EQ(cass_value_type(value), CASS_VALUE_TYPE_DURATION);
+  EXPECT_TRUE(cass_value_is_duration(value));
+  cass_int32_t months = 0;
+  cass_int32_t days = 0;
+  cass_int64_t nanos = 0;
+  EXPECT_EQ(cass_value_get_duration(value, &months, &days, &nanos), CASS_OK);
+  EXPECT_EQ(months, (cass_int32_t)1);
+  EXPECT_EQ(days, (cass_int32_t)2);
+  EXPECT_EQ(nanos, (cass_int64_t)3600000000000LL);
+  cass_result_free(rows);
+
+  // a CQL duration literal must decode through the same v5 wire format
+  EXPECT_TRUE(exec(g_session,
+                   "INSERT INTO demo.t_duration (k, d) VALUES ('literal-key', 1h30m)"));
+  const CassResult* literal_rows =
+      run(g_session, "SELECT d FROM demo.t_duration WHERE k = 'literal-key'");
+  EXPECT_TRUE(literal_rows != NULL);
+  row = cass_result_first_row(literal_rows);
+  EXPECT_TRUE(row != NULL);
+  value = cass_row_get_column_by_name(row, "d");
+  EXPECT_TRUE(value != NULL);
+  EXPECT_EQ(cass_value_type(value), CASS_VALUE_TYPE_DURATION);
+  months = 0;
+  days = 0;
+  nanos = 0;
+  EXPECT_EQ(cass_value_get_duration(value, &months, &days, &nanos), CASS_OK);
+  EXPECT_EQ(months, (cass_int32_t)0);
+  EXPECT_EQ(days, (cass_int32_t)0);
+  EXPECT_EQ(nanos, (cass_int64_t)5400000000000LL);
+  cass_result_free(literal_rows);
   return true;
 }
 
